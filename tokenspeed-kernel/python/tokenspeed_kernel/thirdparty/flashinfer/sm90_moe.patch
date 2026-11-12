@@ -1,60 +1,100 @@
 diff --git a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
-index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..ab6a1dc8c7bbe78da7a7dd59a2a404c78d2f681a 100644
+index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..d587d55bb321ad6c005d13bc6299d0a1093f5caa 100644
 --- a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
 +++ b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
 @@ -58,0 +59 @@
 +#include "tensorrt_llm/deep_gemm/scheduler.cuh"
-@@ -3161,0 +3163 @@
+@@ -877 +878,3 @@
+-                                           int const num_tokens) {
++                                           int const num_tokens, int const* token_selected_experts,
++                                           int64_t const num_experts_per_token,
++                                           int const start_expert_id, bool initialize_remote_maps) {
+@@ -885,0 +889,13 @@
++
++  // The native finalizer filters by expert ID, but deferred consumers own only
++  // this inverse map. Give remote routes a defined sentinel on every replay.
++  // Expert zero owns these stores; local entries are written below, disjointly.
++  if (initialize_remote_maps && target_expert_id == 0 && token_id < num_tokens) {
++    for (int64_t slot = 0; slot < num_experts_per_token; ++slot) {
++      int const expert = token_selected_experts[int64_t(token_id) * num_experts_per_token + slot]
++                         - start_expert_id;
++      if (expert < 0 || expert >= static_cast<int>(gridDim.x)) {
++        unpermuted_row_to_permuted_row[slot * int64_t(num_tokens) + token_id] = -1;
++      }
++    }
++  }
+@@ -908 +924,3 @@
+-                          int64_t const num_blocks_per_seq, bool enable_pdl, cudaStream_t stream) {
++                          int64_t const num_blocks_per_seq, int const* token_selected_experts,
++                          int64_t const num_experts_per_token, int const start_expert_id,
++                          bool initialize_remote_maps, bool enable_pdl, cudaStream_t stream) {
+@@ -926 +944,2 @@
+-                     unpermuted_row_to_permuted_row, num_tokens);
++                     unpermuted_row_to_permuted_row, num_tokens, token_selected_experts,
++                     num_experts_per_token, start_expert_id, initialize_remote_maps);
+@@ -965 +984 @@
+-    int const start_expert_id, bool enable_pdl, cudaStream_t stream) {
++    int const start_expert_id, bool initialize_remote_maps, bool enable_pdl, cudaStream_t stream) {
+@@ -984,2 +1003,3 @@
+-                       num_experts_per_node, num_tokens_per_block, num_blocks_per_seq, enable_pdl,
+-                       stream);
++                       num_experts_per_node, num_tokens_per_block, num_blocks_per_seq,
++                       token_selected_experts, num_experts_per_token, start_expert_id,
++                       initialize_remote_maps, enable_pdl, stream);
+@@ -3161,0 +3182 @@
 +  size_t deepseek_fc2_scales_size = 0;
-@@ -3176,0 +3179,5 @@
+@@ -3176,0 +3198,5 @@
 +    if (is_gated_activation) {
 +      deepseek_fc2_scales_size =
 +          ::deep_gemm::compute_padded_offset(num_rows * experts_per_token, num_experts_per_node) *
 +          ((inter_size + 127) / 128) * sizeof(float);
 +    }
-@@ -3219,0 +3227 @@
+@@ -3219,0 +3246 @@
 +  ADD(deepseek_fc2_scales);
-@@ -3338,0 +3347 @@
+@@ -3338,0 +3366 @@
 +  deepseek_fc2_scales_ = getWsPtr(float{}, "deepseek_fc2_scales");
-@@ -3411 +3420,3 @@
+@@ -3411 +3439,3 @@
 -                           bool enable_pdl, cudaStream_t stream) {
 +                           bool enable_pdl, cudaStream_t stream, int64_t expected_m,
 +                           float* fused_fc2_scales) {
 +  bool const fuse_swiglu_quant = fused_fc2_scales != nullptr;
-@@ -3416 +3427,5 @@
+@@ -3416 +3446,5 @@
 -
 +#ifdef FLASHINFER_SM90_MOE_MAX_STAGES_FC1
 +  constexpr int max_num_stages_fc1 = FLASHINFER_SM90_MOE_MAX_STAGES_FC1;
 +#else
 +  constexpr int max_num_stages_fc1 = -1;
 +#endif
-@@ -3420 +3435,5 @@
+@@ -3420 +3454,5 @@
 -                      quant_params.fp8_block_scaling.fc1_scales_ptrs);
 +                      quant_params.fp8_block_scaling.fc1_scales_ptrs, expected_m,
 +                      max_num_stages_fc1, /*paired_rows=*/fuse_swiglu_quant, false,
 +                      fuse_swiglu_quant ? output : nullptr, fused_fc2_scales, enable_pdl,
 +                      quant_params.fp8_block_scaling.input.data
 +                          ? &quant_params.fp8_block_scaling.input : nullptr);
-@@ -3422,0 +3442,2 @@
+@@ -3422,0 +3461,2 @@
 +  if (fuse_swiglu_quant) return;
 +
-@@ -3453 +3474,2 @@
+@@ -3453 +3493,2 @@
 -                           QuantParams& quant_params, bool enable_pdl, cudaStream_t stream) {
 +                           QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
 +                           int64_t expected_m, float* fused_fc2_scales) {
-@@ -3455,0 +3478,5 @@
+@@ -3455,0 +3497,5 @@
 +#ifdef FLASHINFER_SM90_MOE_MAX_STAGES_FC2
 +  constexpr int max_num_stages_fc2 = FLASHINFER_SM90_MOE_MAX_STAGES_FC2;
 +#else
 +  constexpr int max_num_stages_fc2 = -1;
 +#endif
-@@ -3459,2 +3486,3 @@
+@@ -3459,2 +3505,3 @@
 -                      num_experts_per_node, shape_n, shape_k, stream, nullptr,
 -                      quant_params.fp8_block_scaling.fc2_scales_ptrs);
 +                      num_experts_per_node, shape_n, shape_k, stream, fused_fc2_scales,
 +                      quant_params.fp8_block_scaling.fc2_scales_ptrs, expected_m,
 +                      max_num_stages_fc2, false, fused_fc2_scales != nullptr, nullptr, nullptr, enable_pdl, nullptr);
-@@ -3504,23 +3532,21 @@
+@@ -3463,0 +3511,2 @@
++  // A deferred call retains unweighted BF16 rows for its downstream finalizer.
++  if (final_output == nullptr) return;
+@@ -3504,23 +3553,21 @@
 -void CutlassMoeFCRunner<
 -    T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Sm90Wfp4Afp8Mode,
 -    Enable>::gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
@@ -99,16 +139,16 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..ab6a1dc8c7bbe78da7a7dd59a2a404c7
 +          bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
 +          bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
 +          bool enable_pdl, int64_t expected_m, float* fused_fc2_scales) {
-@@ -3532,2 +3558,2 @@
+@@ -3532,2 +3579,2 @@
 -                        num_experts_per_node, fc1_activation_type, quant_params, enable_pdl,
 -                        stream);
 +                        num_experts_per_node, fc1_activation_type, quant_params, enable_pdl, stream,
 +                        expected_m, fused_fc2_scales);
-@@ -3789 +3815,2 @@
+@@ -3789 +3836,2 @@
 -          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
 +          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
 +          int64_t expected_m, float* fused_fc2_scales) {
-@@ -3801,7 +3828,7 @@
+@@ -3801,7 +3849,7 @@
 -    Self::BlockScaleFC2(*fp8_blockscale_gemm_runner, input, gemm_output, final_output,
 -                        expert_first_token_offset, fc2_expert_weights, fc2_expert_biases,
 -                        unpermuted_final_scales, unpermuted_row_to_permuted_row,
@@ -123,10 +163,11 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..ab6a1dc8c7bbe78da7a7dd59a2a404c7
 +        num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, unpadded_hidden_size,
 +        inter_size, num_experts_per_node, k, parallelism_config, enable_alltoall, quant_params,
 +        enable_pdl, stream, expected_m, fused_fc2_scales);
-@@ -4149 +4176,9 @@
+@@ -4149 +4197,18 @@
 -                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream) {
 +                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
-+                    int64_t expected_m) {
++                    int64_t expected_m, void* deferred_output,
++                    int64_t* deferred_offsets) {
 +#if (defined(FLASHINFER_SM90_MOE_MAX_STAGES_FC1) && FLASHINFER_SM90_MOE_MAX_STAGES_FC1 != -1) || \
 +    (defined(FLASHINFER_SM90_MOE_MAX_STAGES_FC2) && FLASHINFER_SM90_MOE_MAX_STAGES_FC2 != -1)
 +  TLLM_CHECK_WITH_INFO(use_deepseek_fp8_block_scale && !min_latency_mode,
@@ -134,7 +175,24 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..ab6a1dc8c7bbe78da7a7dd59a2a404c7
 +#endif
 +  TLLM_CHECK_WITH_INFO(expected_m == -1 || (use_deepseek_fp8_block_scale && !min_latency_mode),
 +                       "expected_m is supported only by DeepSeek FP8 block-scaled MoE");
-@@ -4312,0 +4348,15 @@
++  TLLM_CHECK_WITH_INFO((deferred_output == nullptr) == (deferred_offsets == nullptr),
++                       "Deferred output and expert offsets must be supplied together");
++  if (deferred_output) {
++    TLLM_CHECK_WITH_INFO(use_deepseek_fp8_block_scale && !min_latency_mode && !use_lora &&
++                            !enable_alltoall && parallelism_config.tp_size == 1 &&
++                            fc1_expert_biases_void == nullptr && fc2_expert_biases_void == nullptr,
++                        "Deferred outputs require bias-free block-FP8 experts without TP or all-to-all");
++  }
+@@ -4188 +4253 @@
+-  auto* final_output = static_cast<OutputType*>(final_output_void);
++  auto* final_output = deferred_output ? nullptr : static_cast<OutputType*>(final_output_void);
+@@ -4311,0 +4377,20 @@
++  if (deferred_offsets) {
++    // The original routing producer writes directly into caller-owned metadata.
++    expert_first_token_offset_ = deferred_offsets;
++  }
++
++
 +  auto const& prepared = quant_params.fp8_block_scaling;
 +  bool const has_prepared_input = prepared.input.data != nullptr;
 +  if (has_prepared_input) {
@@ -149,25 +207,28 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..ab6a1dc8c7bbe78da7a7dd59a2a404c7
 +    unpermuted_row_to_permuted_row = prepared.inverse;
 +    expert_first_token_offset_ = prepared.offsets;
 +  }
-+
-@@ -4316 +4366 @@
+@@ -4316 +4401 @@
 -  bool const needs_num_valid = parallelism_config.ep_size > 1;
 +  bool const needs_num_valid = parallelism_config.ep_size > 1 || has_prepared_input;
-@@ -4353 +4403 @@
+@@ -4353 +4438 @@
 -                min_latency_params.active_expert_global_ids, enable_pdl);
 +                min_latency_params.active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -4369 +4419 @@
+@@ -4369 +4454 @@
 -                min_latency_params.active_expert_global_ids, enable_pdl);
 +                min_latency_params.active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -4372,2 +4422,2 @@
+@@ -4372,2 +4457,2 @@
 -    bool fused_prologue_result = false;
 -    if (!use_sm90_mixed_input_gemm) {
 +    bool fused_prologue_result = has_prepared_input;
 +    if (!has_prepared_input && !use_sm90_mixed_input_gemm) {
-@@ -4425 +4475 @@
+@@ -4388 +4473,2 @@
+-          num_experts_per_node, experts_per_token, start_expert, enable_pdl, stream);
++          num_experts_per_node, experts_per_token, start_expert, deferred_output != nullptr,
++          enable_pdl, stream);
+@@ -4425 +4511 @@
 -    expandInputRowsKernelLauncher(
 +    if (!has_prepared_input) expandInputRowsKernelLauncher(
-@@ -4446,0 +4497,18 @@
+@@ -4446,0 +4533,18 @@
 +    float* fused_fc2_scales = nullptr;
 +#if defined(ENABLE_FP8_BLOCK_SCALE) && defined(FLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT) && \
 +    FLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT
@@ -186,10 +247,10 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..ab6a1dc8c7bbe78da7a7dd59a2a404c7
 +      gemm2_result = glu_inter_result_;
 +    }
 +#endif
-@@ -4488 +4556 @@
+@@ -4488 +4592 @@
 -                nullptr, enable_pdl);
 +                nullptr, enable_pdl, expected_m, fused_fc2_scales);
-@@ -4501,9 +4569,10 @@
+@@ -4501,9 +4605,11 @@
 -    Self::gemm2(
 -        moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
 -        expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
@@ -199,6 +260,7 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..ab6a1dc8c7bbe78da7a7dd59a2a404c7
 -        expanded_num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
 -        experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
 -        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
++    if (deferred_output) gemm2_result = deferred_output;
 +    Self::gemm2(moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
 +                expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights,
 +                fc2_expert_biases, fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_,
@@ -209,8 +271,11 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..ab6a1dc8c7bbe78da7a7dd59a2a404c7
 +                experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
 +                parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr,
 +                enable_pdl, expected_m, fused_fc2_scales);
+@@ -5231 +5337 @@
+-          mNumExpertsPerNode, mK, start_expert_id, enable_pdl, stream);
++          mNumExpertsPerNode, mK, start_expert_id, false, enable_pdl, stream);
 diff --git a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
-index 396830dca29767fb7cff4f29126a5053c90fd485..1a7103c3d7d0e16298e9b7d32b72a3ed8efd5ae5 100644
+index 396830dca29767fb7cff4f29126a5053c90fd485..640356467b40357c51d8e54ba993f21eb86ee4d3 100644
 --- a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
 +++ b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
 @@ -339,0 +340,6 @@
@@ -220,21 +285,49 @@ index 396830dca29767fb7cff4f29126a5053c90fd485..1a7103c3d7d0e16298e9b7d32b72a3ed
 +   * -1 uses the default estimate. Explicit hints require the OSS runner without
 +   * minimum-latency mode and are validated before dispatch.
 +   */
-@@ -353 +359,3 @@
+@@ -353 +359,5 @@
 -              int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv) {
 +              int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv,
 +              int64_t expected_m = -1,
-+              Optional<Array<Tensor>> prepared_input = Optional<Array<Tensor>>{}) {
-@@ -355,0 +364,5 @@
++              Optional<Array<Tensor>> prepared_input = Optional<Array<Tensor>>{},
++              Optional<TensorView> route_map = Optional<TensorView>{},
++              Optional<TensorView> expert_offsets = Optional<TensorView>{}) {
+@@ -355,0 +366,5 @@
 +
 +    TVM_FFI_ICHECK(expected_m == -1 || (expected_m > 0 && expected_m <= UINT32_MAX))
 +        << "expected_m must be -1 or a positive uint32 value";
 +    TVM_FFI_ICHECK(expected_m == -1 || (mUseDeepSeekFP8BlockScaling && !min_latency_mode))
 +        << "expected_m requires DeepSeek FP8 block scaling without min-latency mode";
-@@ -463 +476 @@
+@@ -442,0 +458,25 @@
++    TVM_FFI_ICHECK(route_map.has_value() == expert_offsets.has_value())
++        << "Deferred route map and expert offsets must be supplied together";
++    if (route_map.has_value()) {
++      TVM_FFI_ICHECK(mUseDeepSeekFP8BlockScaling && !min_latency_mode && !enable_alltoall &&
++                    tp_size == 1 && !fc1_expert_biases.has_value() && !fc2_expert_biases.has_value())
++          << "Deferred finalize requires bias-free SM90 block-FP8 without TP/all-to-all";
++      CHECK_INPUT_TYPE(output, dl_bfloat16)
++      CHECK_INPUT_TYPE(route_map.value(), dl_int32)
++      CHECK_INPUT_TYPE(expert_offsets.value(), dl_int64)
++      TVM_FFI_ICHECK(output.IsContiguous() && route_map.value().IsContiguous() &&
++                    expert_offsets.value().IsContiguous());
++      TVM_FFI_ICHECK(output.device().device_type == kDLCUDA &&
++                    route_map.value().device().device_type == kDLCUDA &&
++                    expert_offsets.value().device().device_type == kDLCUDA);
++      TVM_FFI_ICHECK(output.device().device_id == input.device().device_id &&
++                    route_map.value().device().device_id == input.device().device_id &&
++                    expert_offsets.value().device().device_id == input.device().device_id);
++      TVM_FFI_ICHECK(output.ndim() == 2 && output.size(0) == num_rows * experts_per_token &&
++                    output.size(1) == hidden_size);
++      TVM_FFI_ICHECK(route_map.value().ndim() == 1 &&
++                    route_map.value().size(0) == num_rows * experts_per_token);
++      TVM_FFI_ICHECK(expert_offsets.value().ndim() == 1 &&
++                    expert_offsets.value().size(0) == num_experts_on_rank + 1);
++    }
++
+@@ -463 +503 @@
 -    auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
 +    auto quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
-@@ -464,0 +478,42 @@
+@@ -464,0 +505,48 @@
 +#ifdef USING_OSS_CUTLASS_MOE_GEMM
 +    if (prepared_input.has_value()) {
 +      TVM_FFI_ICHECK(mUseDeepSeekFP8BlockScaling && !min_latency_mode && !enable_alltoall &&
@@ -268,6 +361,12 @@ index 396830dca29767fb7cff4f29126a5053c90fd485..1a7103c3d7d0e16298e9b7d32b72a3ed
 +                      tensor.device().device_id == input.device().device_id &&
 +                      reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0);
 +      }
++      if (route_map.has_value()) {
++        // Prepared routing stays read-only. Deferred consumers must retain these exact maps.
++        TVM_FFI_ICHECK(route_map.value().data_ptr() == inverse.data_ptr() &&
++                      expert_offsets.value().data_ptr() == offsets.data_ptr())
++            << "Deferred prepared routes must retain the producer's inverse and offsets";
++      }
 +      quant_params.fp8_block_scaling.input = {packed.data_ptr(),
 +          static_cast<float const*>(scales.data_ptr()), capacity, scale_ld};
 +      quant_params.fp8_block_scaling.source_rows = static_cast<int*>(source_rows.data_ptr());
@@ -277,19 +376,31 @@ index 396830dca29767fb7cff4f29126a5053c90fd485..1a7103c3d7d0e16298e9b7d32b72a3ed
 +#else
 +    TVM_FFI_ICHECK(!prepared_input.has_value()) << "Prepared routes require the OSS runner";
 +#endif
-@@ -487 +542 @@
+@@ -485 +573,2 @@
+-        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
++        output.data_ptr(), route_map.has_value() ? static_cast<int*>(route_map.value().data_ptr())
++                                                : static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+@@ -487 +576,3 @@
 -        min_latency_mode, min_latency_params, enable_pdl, stream);
-+        min_latency_mode, min_latency_params, enable_pdl, stream, expected_m);
-@@ -488,0 +544 @@
++        min_latency_mode, min_latency_params, enable_pdl, stream, expected_m,
++        route_map.has_value() ? output.data_ptr() : nullptr,
++        expert_offsets.has_value() ? static_cast<int64_t*>(expert_offsets.value().data_ptr()) : nullptr);
+@@ -488,0 +580,2 @@
++    TVM_FFI_ICHECK(!route_map.has_value()) << "Deferred finalize requires the OSS runner";
 +    TVM_FFI_ICHECK_EQ(expected_m, -1) << "expected_m requires the OSS CUTLASS MoE runner";
-@@ -783,0 +840 @@
+@@ -501 +594,2 @@
+-        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
++        output.data_ptr(), route_map.has_value() ? static_cast<int*>(route_map.value().data_ptr())
++                                                : static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+@@ -783,0 +878 @@
 +  /** @brief Return a named MoE execution or profiling entry point for TVM FFI. */
-@@ -845 +902 @@
+@@ -845 +940,2 @@
 -                 int64_t nvfp4_4over6_code) {
-+                 int64_t nvfp4_4over6_code, int64_t expected_m, Optional<Array<Tensor>> prepared_input) {
-@@ -852 +909 @@
++                 int64_t nvfp4_4over6_code, int64_t expected_m, Optional<Array<Tensor>> prepared_input,
++                 Optional<TensorView> route_map, Optional<TensorView> expert_offsets) {
+@@ -852 +948 @@
 -                   nvfp4_4over6_code);
-+                   nvfp4_4over6_code, expected_m, prepared_input);
++                   nvfp4_4over6_code, expected_m, prepared_input, route_map, expert_offsets);
 diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
 index fbdc902972668033d6bd8653d60c875dd51889f7..5cf6590c561c80f0ca7c7d6f30e6c58ff6622e76 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
@@ -1294,7 +1405,7 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..b121f8b1e5ce16921fc07c3a14ae5042
 -      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched);
 +      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched, false, false, false, false);
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
-index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..469746bea26880a35cc87ba1d9264797fb4c2d10 100644
+index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..3af1870244ba06c73bd920928b8c95f40f9ea74f 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
 @@ -339,0 +340,4 @@
@@ -1308,23 +1419,25 @@ index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..469746bea26880a35cc87ba1d9264797
 +   * @param expected_m Per-call token estimate for both DeepSeek FP8 block-scale
 +   * GEMMs, or -1 for the default estimate. Explicit hints exclude minimum-latency mode.
 +   */
-@@ -494,2 +503,2 @@
+@@ -494,2 +503,3 @@
 -                      MoeMinLatencyParams& min_latency_params, bool enable_pdl,
 -                      cudaStream_t stream) = 0;
 +                      MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
-+                      int64_t expected_m = -1) = 0;
-@@ -708,0 +718,5 @@
++                      int64_t expected_m = -1, void* deferred_output = nullptr,
++                      int64_t* deferred_offsets = nullptr) = 0;
+@@ -708,0 +719,5 @@
 +  /**
 +   * @brief Permute tokens, run both expert GEMMs, and finalize the MoE output.
 +   * @param expected_m DeepSeek FP8 token estimate forwarded to both GEMMs for
 +   * this call, or -1 to retain their default configuration-selection policy.
 +   */
-@@ -720,2 +734,2 @@
+@@ -720,2 +735,3 @@
 -              MoeMinLatencyParams& min_latency_params, bool enable_pdl,
 -              cudaStream_t stream) override;
 +              MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
-+              int64_t expected_m = -1) override;
-@@ -724,27 +738,38 @@
++              int64_t expected_m = -1, void* deferred_output = nullptr,
++              int64_t* deferred_offsets = nullptr) override;
+@@ -724,27 +740,38 @@
 -  static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
 -                                  Sm90Wfp4Afp8Mode>& gemm_runner,
 -                    // This argument must not be null if fp8 block scaling is being used.
@@ -1390,23 +1503,23 @@ index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..469746bea26880a35cc87ba1d9264797
 +   * @param expected_m Per-call token estimate for the FP8 block-scale runner;
 +   * -1 uses its default estimate. Other GEMM paths do not consume this hint.
 +   */
-@@ -771 +796 @@
+@@ -771 +798 @@
 -      bool enable_pdl);
 +      bool enable_pdl, int64_t expected_m, float* fused_fc2_scales);
-@@ -802 +827 @@
+@@ -802 +829 @@
 -                       active_expert_global_ids, enable_pdl);
 +                       active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -837 +862 @@
+@@ -837 +864 @@
 -        num_active_experts_per, active_expert_global_ids, enable_pdl);
 +        num_active_experts_per, active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -991,0 +1017,6 @@
+@@ -991,0 +1019,6 @@
 +  /**
 +   * @brief Run the first FP8 block-scale expert GEMM and apply its activation.
 +   * @param fused_fc2_scales Non-null selects fused FP8 output and receives its padded scales.
 +   * @param expected_m Token estimate forwarded to DeepGEMM for this call, or -1
 +   * for the runner's default estimate. The workspace must already be configured.
 +   */
-@@ -1001,2 +1032,9 @@
+@@ -1001,2 +1034,9 @@
 -                            bool enable_pdl, cudaStream_t stream);
 -
 +                            bool enable_pdl, cudaStream_t stream, int64_t expected_m,
@@ -1418,14 +1531,14 @@ index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..469746bea26880a35cc87ba1d9264797
 +   * @param expected_m Token estimate forwarded to DeepGEMM for this call, or -1
 +   * for the runner's default estimate. The workspace must already be configured.
 +   */
-@@ -1014 +1052,2 @@
+@@ -1014 +1054,2 @@
 -      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream);
 +      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
 +      int64_t expected_m, float* fused_fc2_scales);
-@@ -1044,0 +1084 @@
+@@ -1044,0 +1086 @@
 +  float* deepseek_fc2_scales_{};
 diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
-index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..8db413a83dbd3d942472452aaaab34ee3256e19f 100644
+index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..b795bff88d2b37e287af219309801d43895b0f6b 100644
 --- a/flashinfer/fused_moe/core.py
 +++ b/flashinfer/fused_moe/core.py
 @@ -636,0 +637,23 @@
@@ -1477,13 +1590,17 @@ index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..8db413a83dbd3d942472452aaaab34ee
 +    if enable_sm90_moe_optimizations:
 +        op_name += "_sm90_grouped_optimized"
 +
-@@ -972 +1010 @@
+@@ -972,2 +1010,2 @@
 -        "flashinfer::cutlass_fused_moe",
+-        mutates_args=("output", "workspace_buffer"),
 +        op_name,
-@@ -1014,0 +1053,2 @@
++        mutates_args=("output", "workspace_buffer", "route_map", "expert_offsets"),
+@@ -1014,0 +1053,4 @@
 +        expected_m: Optional[int] = None,
 +        prepared_input: Optional[List[torch.Tensor]] = None,
-@@ -1015,0 +1056,12 @@
++        route_map: Optional[torch.Tensor] = None,
++        expert_offsets: Optional[torch.Tensor] = None,
+@@ -1015,0 +1058,12 @@
 +        """Execute CUTLASS MoE with the selected tactics and workspace.
 +
 +        Forward expected_m to both DeepSeek FP8 block-scale expert GEMMs for
@@ -1496,29 +1613,37 @@ index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..8db413a83dbd3d942472452aaaab34ee
 +                min_latency_mode=min_latency_mode,
 +                backend="cutlass",
 +            )
-@@ -1143,0 +1196,5 @@
+@@ -1143,0 +1198,5 @@
 +            *(
 +                []
 +                if min_latency_mode
-+                else [expected_m if expected_m is not None else -1, prepared_input]
++                else [expected_m if expected_m is not None else -1, prepared_input, route_map, expert_offsets]
 +            ),
-@@ -1157 +1214 @@
+@@ -1157 +1216 @@
 -    @register_fake_op("flashinfer::cutlass_fused_moe")
 +    @register_fake_op(op_name)
-@@ -1197,0 +1255,2 @@
+@@ -1197,0 +1257,4 @@
 +        expected_m: Optional[int] = None,
 +        prepared_input: Optional[List[torch.Tensor]] = None,
-@@ -1198,0 +1258,5 @@
++        route_map: Optional[torch.Tensor] = None,
++        expert_offsets: Optional[torch.Tensor] = None,
+@@ -1198,0 +1262,5 @@
 +        """Infer output tensors for fake execution of the CUTLASS MoE operation.
 +
 +        Minimum-latency mode also returns expert-routing metadata. The
 +        expected_m scheduling hint does not affect output shapes or dtypes.
 +        """
-@@ -1331,0 +1396,3 @@
+@@ -1214 +1282,2 @@
+-            return [input.new_empty([seq_len, hidden_size], dtype=output_dtype)]
++            rows = seq_len * token_selected_experts.shape[1] if route_map is not None else seq_len
++            return [input.new_empty([rows, hidden_size], dtype=output_dtype)]
+@@ -1331,0 +1401,5 @@
 +    expected_m: Optional[int] = None,
 +    enable_sm90_moe_optimizations: bool = False,
 +    prepared_input: Optional[List[torch.Tensor]] = None,
-@@ -1528,0 +1596,18 @@
++    route_map: Optional[torch.Tensor] = None,
++    expert_offsets: Optional[torch.Tensor] = None,
+@@ -1528,0 +1603,18 @@
 +
 +    expected_m : Optional[int]
 +        Expected number of tokens per local expert for DeepGEMM configuration selection.
@@ -1537,7 +1662,7 @@ index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..8db413a83dbd3d942472452aaaab34ee
 +        scheduling and ignores the former ``MOE_MBU_*`` environment switches.
 +        Choose this option before warmup and CUDA graph capture. Modules, native
 +        kernel caches and tuning keys are separate for the two configurations.
-@@ -1570,0 +1656,15 @@
+@@ -1570,0 +1663,15 @@
 +    if type(enable_sm90_moe_optimizations) is not bool:
 +        raise TypeError("enable_sm90_moe_optimizations must be a bool")
 +    if enable_sm90_moe_optimizations and (
@@ -1553,11 +1678,19 @@ index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..8db413a83dbd3d942472452aaaab34ee
 +            min_latency_mode=min_latency_mode,
 +            backend=backend,
 +        )
-@@ -1651,0 +1752,3 @@
+@@ -1651,0 +1759,11 @@
 +    if prepared_input is not None:
 +        if not use_deepseek_fp8_block_scale or min_latency_mode or enable_alltoall or tp_size != 1:
 +            raise ValueError("Prepared input requires SM90 block-FP8 without TP/all-to-all")
-@@ -1662 +1765,7 @@
++    if (route_map is None) != (expert_offsets is None):
++        raise ValueError("Deferred route map and expert offsets must be supplied together")
++    if route_map is not None:
++        if not use_deepseek_fp8_block_scale or min_latency_mode or enable_alltoall or tp_size != 1:
++            raise ValueError("Deferred finalize requires SM90 block-FP8 without TP/all-to-all")
++        num_rows *= token_selected_experts.shape[1]
++        if use_fused_finalize:
++            raise ValueError("Deferred outputs require use_fused_finalize=False")
+@@ -1662 +1780,7 @@
 -        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
 +        if enable_sm90_moe_optimizations:
 +            module = get_cutlass_fused_moe_module(
@@ -1566,6 +1699,8 @@ index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..8db413a83dbd3d942472452aaaab34ee
 +        else:
 +            module = get_cutlass_fused_moe_module(device_arch)
 +        return module.cutlass_fused_moe(
-@@ -1700,0 +1810,2 @@
+@@ -1700,0 +1825,4 @@
 +            expected_m=expected_m,
 +            prepared_input=prepared_input,
++            route_map=route_map,
++            expert_offsets=expert_offsets,

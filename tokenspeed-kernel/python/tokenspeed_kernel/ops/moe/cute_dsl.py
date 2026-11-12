@@ -31,6 +31,26 @@ from tokenspeed_kernel.signature import format_signatures
 
 @register_kernel(
     "moe",
+    "combine_quant_fp8",
+    name="cute_dsl_combine_quant_fp8",
+    solution="cute_dsl",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(9, 0),
+        max_arch_version=ArchVersion(9, 0),
+    ),
+    signatures=format_signatures("partial", "dense", {torch.bfloat16}),
+    priority=Priority.SPECIALIZED,
+)
+def cute_dsl_combine_quant_fp8(partial, inverse, weights, valid_rows, out):
+    """Run the ordered route reduction and projection quantizer on Hopper."""
+    from tokenspeed_kernel.ops.moe._cute_dsl.combine_quant import run_combine_quant
+
+    return run_combine_quant(partial, inverse, weights, valid_rows, out)
+
+
+@register_kernel(
+    "moe",
     "route_quant_fp8",
     name="cute_dsl_route_quant_fp8",
     solution="cute_dsl",
@@ -103,6 +123,7 @@ def cute_dsl_fp8_moe_process_weights(plan: dict, w: torch.nn.Module) -> None:
         "activation": frozenset({"silu", "swiglu"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
+        "supports_deferred_routes": frozenset({True}),
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({False}),
         "ispp_alignment": frozenset({128}),
@@ -133,10 +154,11 @@ def cute_dsl_fp8_moe_apply(
 
     ``x`` is BF16 [tokens, hidden]; ``w`` owns processed checkpoint weights and
     the native callables initialized by ``moe_process_weights``. The remaining
-    arguments follow ``moe_apply``. Returns finalized BF16 [tokens, hidden].
+    arguments follow ``moe_apply``. Normal calls return finalized BF16
+    [tokens, hidden]; ``moe_apply_routes`` requests owned unweighted route rows.
     """
-    if not do_finalize:
-        raise ValueError("CuTe DSL FP8 MoE requires finalized output")
+    if not do_finalize and plan["cutlass_fused_finalize"]:
+        raise ValueError("Deferred routes require cutlass_fused_finalize=False")
     if topk_ids is None or topk_weights is None:
         raise ValueError("CuTe DSL FP8 MoE requires precomputed top-k")
     if (
@@ -154,7 +176,11 @@ def cute_dsl_fp8_moe_apply(
     from tokenspeed_kernel.ops.moe.route_quant import route_quant_fp8
     from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 
-    output = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    if not do_finalize and not 1 <= x.shape[0] <= 4096:
+        raise ValueError("Deferred block-FP8 MoE supports 1..4096 tokens")
+    output = (
+        torch.empty(x.shape, dtype=x.dtype, device=x.device) if do_finalize else None
+    )
     if x.shape[0] == 0:
         return output
     ids = topk_ids.to(torch.int32).contiguous()
@@ -178,7 +204,16 @@ def cute_dsl_fp8_moe_apply(
             solution="cute_dsl",
         )
     native = state.native_for_tokens(x.shape[0])
-    return native(
+    route_outputs = {}
+    if not do_finalize:
+        from tokenspeed_kernel.ops.moe.combine_quant import allocate_deferred_routes
+
+        routes = allocate_deferred_routes(x, weights, w.w13_weight.shape[0], prepared)
+        output = routes.partial
+        route_outputs = dict(
+            route_map=routes.inverse.T.reshape(-1), expert_offsets=routes.expert_offsets
+        )
+    result = native(
         output=output,
         input=x,
         token_selected_experts=ids,
@@ -199,7 +234,9 @@ def cute_dsl_fp8_moe_apply(
         enable_pdl=enable_pdl,
         expected_m=None,
         prepared_input=prepared,
-    )[0]
+        **route_outputs,
+    )
+    return result[0] if do_finalize else routes
 
 
 # ===-----------------------------------------------------------------------===#

@@ -114,6 +114,51 @@ installed module's cold compilation to patched headers.
 The installed FlashInfer package is unchanged. To switch settings, prepare a
 new callable, warm it up, and recapture graphs.
 
+### Deferred block-FP8 finalization
+
+`prepare_sm90_fp8_moe_routes` retains both expert GEMMs in the native runner
+and defers only the weighted route reduction. It returns BF16 expert rows,
+the original slot-major inverse map viewed as `[tokens, topk]`, route weights,
+and expert offsets written by the same invocation. The final offset bounds
+initialized rows; remote routes must not read the unused allocation tail.
+The native three-step map builder writes invalid inverse entries for remote
+routes on every deferred invocation, including graph replay. Its existing
+merge kernel owns these stores; no extra initialization kernel is launched.
+Caller-provided destinations must be disjoint and remain live until all
+consumers finish. Graph replay refreshes their contents without changing
+addresses. Separate streams require ordinary producer/consumer dependencies.
+The adapter explicitly disables native fused finalization. Direct native calls
+with deferred destinations must also pass `use_fused_finalize=False`; a
+conflicting request raises before any destination is written.
+
+`combine_quant_fp8` reduces routes in slot order, rounds the sum to BF16, and
+quantizes each 128-channel block to E4M3. Scales use logical `[tokens, hidden/128]` and
+physical stride `(1, tokens)`. It consumes either token-major or slot-major
+maps directly. The current solution supports Hopper, positive hidden sizes
+divisible by 128, model-static top-k in 1..32, finite inputs, and 1..4096 tokens.
+Expert counts remain native-runner inputs. Changing width or top-k requires
+startup warmup of its compiled variant. These API bounds do not establish
+validation or performance coverage for an untested model. Token counts and dependent strides are
+runtime parameters, not new compilation variants. Warm both map layouts that
+will be used before graph capture.
+
+The CuTe implementation explicitly selects round-to-nearest-even division for
+output quantization with `cute.math.div`. This differs from the native
+approximate arithmetic retained by input route quantization below.
+
+This operation leaves output projection and communication to their existing
+callers. It does not select a new model execution path automatically, and
+deferred outputs must not be passed to the ordinary finalizer as well.
+
+The native adapter infers hidden width H and intermediate width I from the
+input and processed expert weights. H and I must be positive multiples of 128.
+FC1 weights have shape `[experts, 2*I, H]` and FC2 weights `[experts, H, I]`;
+their FP32 scale shapes follow the native 128x128 weight blocks. BF16 activations
+and E4M3 weights are the supported numerical contract for this entry point.
+The adapter retains native TP, bias and communication restrictions; it does not
+reinterpret other quantization formats or select a model-specific path.
+Tests use synthetic expert counts, routing and dimensions independently.
+
 `expected_m` is a positive uint32 hint for both expert GEMMs in one call;
 omitting it preserves the native estimate. For complete local expert groups,
 use `max(1, ceil(local_rows * top_k / local_experts))`; replicated-input EP
@@ -515,10 +560,12 @@ Quantization uses `cute.math.div(approx=True, ftz=True)` and
 flush-to-zero reciprocal. Ordinary division or a differently rounded
 reciprocal is not an interchangeable numerical contract.
 
-The CuTe input quantizer uses the aligned four-value reader in
-`thirdparty/cute_dsl/memory.py`. Callers supply valid eight-byte-aligned
-global addresses and retain their own bounds checks;
-the helper preserves BF16/FP16-to-FP32 conversion and element order.
+Both fused kernels use the aligned memory primitives in
+`thirdparty/cute_dsl/memory.py`. The four-value BF16/FP16 reader is shared by
+the input and output quantizers; the packed E4M3 writer is also used by MSA.
+Callers supply valid aligned addresses and retain their own bounds checks.
+These helpers keep packed memory instructions and conversion semantics in
+one implementation.
 
 A `PreparedMoEInput` retains the original inputs, the packed data, and the
 same invocation's maps. Its logical inverse map is `[tokens, topk]` with
@@ -831,3 +878,14 @@ also exercise uneven/empty owners over multiple GPUs:
 python -m torch.distributed.run --standalone --nproc-per-node=2 -m pytest -q \
   tokenspeed-kernel/test/nvidia/ops/moe/test_deep_gemm_mxfp4_mega_moe.py
 ```
+
+
+The SM90 route-input leaf also advertises `supports_deferred_routes`.
+`moe_apply_routes` uses the same prepared weights and native schedule as
+`moe_apply`, with `cutlass_fused_finalize=False` explicitly selected before
+warmup. It returns `DeferredMoERoutes` rather than the legacy three-tensor
+finalize tuple; the existing `moe_apply` finalized output is unchanged.
+Prepared input and deferred output share the producer's read-only inverse
+map and offsets. The native binding rejects different metadata destinations.
+Without prepared input, native routing writes fresh caller-owned metadata.
+Combine/quant consumers must retain these allocations through graph replay.
