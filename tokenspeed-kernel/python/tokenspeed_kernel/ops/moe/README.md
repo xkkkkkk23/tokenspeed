@@ -4,6 +4,10 @@ Per-op notes for `ops/moe/`.
 
 ## Deferred route outputs
 
+Input and output fusion can be used independently. This combined version
+reuses prepared input rows and maps when the input producer supports the call;
+otherwise output fusion consumes the native input preparation results.
+
 `bf16_moe_routes` returns individual, unweighted expert outputs. Deferred MXFP4
 execution also returns a map from each original route to its output row, with
 `-1` for remote experts. Consumers normalize each route before weighting and
@@ -79,8 +83,9 @@ local expert counts use the registered route quantizer. Unsupported layouts,
 extents, TP configurations, and larger local expert counts use the selected
 native callable's input preparation. Every call owns its
 route buffers; graph capture keeps the allocator's captured storage alive.
-Both paths preserve native GEMM and finalized-output semantics. Deferred output,
-all-to-all, clamped activation, and the batch-invariant numerical envelope are
+Both paths preserve native GEMM and finalized-output semantics. Deferred
+output is exposed separately through `moe_apply_routes`, described below.
+All-to-all, clamped activation, and the batch-invariant numerical envelope are
 not advertised by this solution.
 
 Hidden width and local expert count come from the prepared weight tensors;
