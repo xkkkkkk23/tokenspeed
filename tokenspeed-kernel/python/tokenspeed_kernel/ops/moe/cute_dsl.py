@@ -173,7 +173,7 @@ def cute_dsl_fp8_moe_apply(
     if not isinstance(state, _RouteQuantMoEState):
         raise RuntimeError("Prepare FP8 MoE weights before execution")
     from flashinfer import ActivationType
-    from tokenspeed_kernel.ops.moe.route_quant import route_quant_fp8
+    from tokenspeed_kernel.ops.moe.route_quant import TOKEN_BUCKETS, route_quant_fp8
     from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 
     if not do_finalize and not 1 <= x.shape[0] <= 4096:
@@ -189,7 +189,7 @@ def cute_dsl_fp8_moe_apply(
     # Token count is runtime within finite compilation buckets. Keep the native
     # producer for layouts/parallelism and extents outside the fused contract.
     if (
-        x.shape[0] <= 256
+        x.shape[0] <= TOKEN_BUCKETS[-1]
         and x.is_contiguous()
         and x.data_ptr() % 16 == 0
         and 1 <= w.w13_weight.shape[0] <= 1024
